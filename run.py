@@ -159,9 +159,11 @@ parser.add_argument('--use_time_index', type=int, default=1, help='whether to us
 parser.add_argument('--time_feature_dim', type=int, default=6, help='maximum number of raw calendar time features projected into the trend context gate')
 parser.add_argument('--memory_size', type=int, default=64, help='trend context memory bank size')
 parser.add_argument('--top_k', type=int, default=5, help='top-k trend contexts retrieved from memory')
-parser.add_argument('--res_aug_version', type=str, default='new', choices=['new', 'origin'], help='positive augmentation used in FAT_res_trend_gate_new residual pretrain')
+parser.add_argument('--res_aug_version', type=str, default='denoise', choices=['origin', 'mask_indep', 'denoise', 'denoise_freq'], help='positive augmentation: origin=shared mask, mask_indep=independent masks, denoise=multi-view denoising, denoise_freq=denoising with freq view')
 parser.add_argument('--res_use_kb', type=int, default=1, help='whether to use KnowledgeGuide_encoder in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
 parser.add_argument('--res_use_revin', type=int, default=1, help='whether to use RevIN on residual series in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
+parser.add_argument('--res_pretrain_use_time', type=int, default=0, help='whether to pass time features batch_x_mark to FAT_res_trend_gate_new during pretraining; 1=on 0=off')
+parser.add_argument('--res_recon_target', type=str, default='raw', choices=['raw', 'consensus'], help='reconstruction target: raw=original batch_x (version A), consensus=mean of denoised views (version B)')
 args = parser.parse_args()
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

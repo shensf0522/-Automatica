@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 import math
 from utils.masking import get_mask
 
@@ -339,3 +340,97 @@ def augment_positive_test_origin(sample, masking_ratio, lm, distribution='geomet
 
     x_augmented = torch.cat([x_blank_masked, x_t_distorted, x_zoomed], dim=0)
     return x_augmented.permute(1,0,2)
+
+
+def _temporal_smooth(x, kernel_size=3):
+    """去高频抖动：小窗口移动平均，保留局部趋势，去除逐点震荡。"""
+    b_n, seq_len = x.shape
+    x_1d = x.unsqueeze(1)                                       # (b_n, 1, seq_len)
+    pad_left = (kernel_size - 1) // 2
+    pad_right = kernel_size - 1 - pad_left
+    x_padded = F.pad(x_1d, (pad_left, pad_right), mode='replicate')
+    smoothed = F.avg_pool1d(x_padded, kernel_size, stride=1)
+    return smoothed.squeeze(1)                                   # (b_n, seq_len)
+
+
+def _median_filter(x, kernel_size=3):
+    """去脉冲突变：中值滤波，保留边沿，去除极端尖刺。"""
+    b_n, seq_len = x.shape
+    pad = kernel_size // 2
+    x_padded = F.pad(x.unsqueeze(1), (pad, pad), mode='replicate')  # (b_n, 1, seq_len+2*pad)
+    x_unfolded = x_padded.unfold(2, kernel_size, 1)                  # (b_n, 1, seq_len, kernel_size)
+    median_vals = x_unfolded.median(dim=-1).values.squeeze(1)        # (b_n, seq_len)
+    return median_vals
+
+
+def _predictability_filter(x):
+    """去不可预测成分：用左右邻居的均值估计每个点，保留可预测结构。"""
+    padded = F.pad(x.unsqueeze(1), (1, 1), mode='replicate').squeeze(1)  # (b_n, seq_len+2)
+    pred_view = (padded[:, :-2] + padded[:, 2:]) / 2.0                  # (b_n, seq_len)
+    return pred_view
+
+
+def _frequency_denoise(x, keep_ratio=0.5):
+    """频域去噪：保留能量最强的频率分量，柔性衰减弱频率分量。"""
+    fft = torch.fft.rfft(x, dim=-1)
+    magnitudes = torch.abs(fft)
+    n_freq = fft.shape[-1]
+    k = max(1, int(n_freq * keep_ratio))
+    sorted_mag, _ = torch.sort(magnitudes, dim=-1, descending=True)
+    threshold = sorted_mag[:, k - 1: k]                                  # (b_n, 1)
+    # 强频保留原样，弱频按比例衰减（不是直接归零，避免信息丢失过多）
+    attenuation = torch.clamp(magnitudes / (threshold + 1e-8), max=1.0)
+    fft_filtered = fft * attenuation
+    return torch.fft.irfft(fft_filtered, n=x.shape[-1], dim=-1)
+
+
+def denoise_multi_view(sample, masking_ratio=None, lm=None, distribution=None, scale=None, k=3):
+    """
+    多视角去噪增强：每个视图是一种不同的信号处理"翻译器"。
+
+    不同于传统的破坏式增强（mask/噪声/拉伸），这里每个视图从不同角度
+    去除一种特定类型的噪声，保留有用信息。Encoder通过CL学习三个视图的
+    共识表示，从而实现去噪。
+
+    View 1 – 时间平滑：去除高频逐点震荡
+    View 2 – 中值滤波：去除脉冲突变/离群点
+    View 3 – 可预测滤波：去除不可预测的随机成分
+
+    Args:
+        sample: (b_n, seq_len) 输入信号
+        masking_ratio, lm, distribution, scale: 占位参数，保持接口兼容
+        k: 正样本数量（目前固定为3）
+
+    Returns:
+        (b_n, k, seq_len) 去噪视图
+    """
+    view1 = _temporal_smooth(sample, kernel_size=3)
+    view2 = _median_filter(sample, kernel_size=3)
+    view3 = _predictability_filter(sample)
+
+    views = torch.stack([view1, view2, view3], dim=1)            # (b_n, 3, seq_len)
+    return views[:, :k, :]
+
+
+def denoise_multi_view_freq(sample, masking_ratio=None, lm=None, distribution=None, scale=None, k=3):
+    """
+    多视角去噪增强（含频域视角）：
+
+    View 1 – 时间平滑：去除高频逐点震荡
+    View 2 – 中值滤波：去除脉冲突变/离群点
+    View 3 – 频域滤波：柔性衰减弱能量频率分量
+
+    Args:
+        sample: (b_n, seq_len) 输入信号
+        masking_ratio, lm, distribution, scale: 占位参数，保持接口兼容
+        k: 正样本数量（目前固定为3）
+
+    Returns:
+        (b_n, k, seq_len) 去噪视图
+    """
+    view1 = _temporal_smooth(sample, kernel_size=3)
+    view2 = _median_filter(sample, kernel_size=3)
+    view3 = _frequency_denoise(sample, keep_ratio=0.5)
+
+    views = torch.stack([view1, view2, view3], dim=1)            # (b_n, 3, seq_len)
+    return views[:, :k, :]
