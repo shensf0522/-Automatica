@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from utils.augmentations import augment_positive_test
+from utils.augmentations import augment_positive_test, augment_positive_test_origin
 from utils.tools import ContrastiveWeight, AggregationRebuild, generate_CLLabels, FFT_sim
 from utils.losses import AutomaticWeightedLoss
 from layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer
@@ -389,6 +389,15 @@ class Model(nn.Module):
         self.memory_top_k = getattr(configs, 'top_k', 5)
         self.use_time_index = bool(getattr(configs, 'use_time_index', 1))
         self.time_feature_dim = getattr(configs, 'time_feature_dim', 6)
+        self.res_aug_version = getattr(configs, 'res_aug_version', 'new')
+        self.res_use_kb = bool(getattr(configs, 'res_use_kb', 1))
+        self.res_use_revin = bool(getattr(configs, 'res_use_revin', 1))
+        if self.res_aug_version == 'new':
+            self.res_augment_fn = augment_positive_test
+        elif self.res_aug_version == 'origin':
+            self.res_augment_fn = augment_positive_test_origin
+        else:
+            raise ValueError(f"Unsupported res_aug_version: {self.res_aug_version}")
 
         self.trend_context_encoder = TrendContextEncoder(
             configs.d_model,
@@ -484,15 +493,22 @@ class Model(nn.Module):
 
         trend = moving_average(batch_x, self.decomp_kernel)
         res_ts = batch_x - trend
-        z = self.revin_layer_encoder(res_ts, 'norm')
+        if self.res_use_revin:
+            z = self.revin_layer_encoder(res_ts, 'norm')
+        else:
+            z = res_ts
 
         r_series = z.permute(0, 2, 1)
         sim_matrix = FFT_sim(r_series)
         r_normed = r_series.reshape(-1, seq_len)
         negative_index = torch.topk(sim_matrix, k=self.configs.negative_nums, dim=1).indices
 
-        r_reformed, _ = self.KnowledgeGuide_encoder(r_normed)
-        r_positives = augment_positive_test(
+        if self.res_use_kb:
+            r_reformed, _ = self.KnowledgeGuide_encoder(r_normed)
+        else:
+            r_reformed = r_normed
+
+        r_positives = self.res_augment_fn(
             r_reformed,
             self.configs.mask_rate,
             self.configs.lm,
@@ -543,98 +559,14 @@ class Model(nn.Module):
         fused_embed, _ = self._filter_residual_with_context(rebuild_embed, trend, batch_x_mark)
         pred_res = self.head_pretrain(fused_embed)
         pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        pred_res = self.revin_layer_encoder(pred_res, 'denorm')
+        if self.res_use_revin:
+            pred_res = self.revin_layer_encoder(pred_res, 'denorm')
         pred_x = pred_res + trend
 
         loss_rb = self.mse(batch_x, pred_x)
         loss = self.awl(loss_cl, loss_rb)
         return loss, loss_cl, loss_rb, None, None, None
 
-
-    def pretrain_residual(self, batch_x, batch_x_mark=None):
-        return self.pretrain_context_gate(batch_x, batch_x_mark)
-        """
-        残差自监督预训练：
-        1）使用 RevIN 归一化 -> z
-        2）用 moving_average 得到显式结构 trend
-        3）残差 r = z - trend
-        4）在 r 上做随机掩码，用 FAT encoder 编码，重建被掩码的 r
-        5）loss = 只在掩码位置上的 MSE
-        """
-        bs, seq_len, n_vars = batch_x.shape  # [B, S, N]
-
-        # 1) 显式结构（趋势） + 残差
-        trend = moving_average(batch_x, self.decomp_kernel)  # [B, S, N]
-        res_ts = batch_x - trend  # [B, S, N]
-
-        # # 修改为多尺度的抽离
-        # trend, _ = self.compute_trend(batch_x)  # [B, S, N] + list
-        # res_ts = batch_x - trend  # [B, S, N]
-
-        # 2) RevIN 归一化（完全沿用 FAT 的逻辑）
-        z = self.revin_layer_encoder(res_ts, 'norm')  # [B, S, N]
-
-        r_normed = z
-        r_normed = r_normed.permute(0, 2, 1)
-        sim_matrix = FFT_sim(r_normed)  # (b*n, b*n)   不同样本，不同特征之间的相似性
-        r_normed = r_normed.reshape(-1, seq_len)  # (b*n, s)
-        negative_index = torch.topk(sim_matrix, k=self.configs.negative_nums, dim=1).indices
-        # Knowledge_guide
-        r_reformed, _ = self.KnowledgeGuide_encoder(r_normed)  # B, N, D
-        # torch.save(x_reformed, "./ecl_336_x_reformed.pt")
-        r_positives = augment_positive_test(r_reformed, self.configs.mask_rate, self.configs.lm,
-                                            k=self.configs.positive_nums)
-        r_positives = r_positives.reshape(-1, seq_len)
-        r_all = torch.cat([r_normed, r_positives], dim=0)
-
-        # Encoderr
-        enc_out = self.enc_embedding(r_all.unsqueeze(-1))
-        enc_out, _ = self.encoder(enc_out)
-        # Contrastive Learning
-        s_enc_out = self.cl_projection(enc_out)
-        s_enc_out = F.normalize(s_enc_out, dim=1)
-        s_q = s_enc_out[: bs * n_vars]
-        s_k = s_enc_out[bs * n_vars:].reshape(bs * n_vars, self.configs.positive_nums, -1)
-        if self.labels_cl is None:
-            self.labels_cl = generate_CLLabels(r_normed, self.configs.positive_nums, self.configs.negative_nums)
-        if self.configs.positive_nums == 1:
-            positive_similarity_matrix = torch.matmul(s_q.unsqueeze(1), s_k.permute(0, 2, 1)).squeeze(-1)
-        else:
-            positive_similarity_matrix = torch.matmul(s_q.unsqueeze(1), s_k.permute(0, 2, 1)).squeeze()
-        if self.configs.negative_nums == 1:
-            negative_similarity_matrix = torch.matmul(s_q.unsqueeze(1),
-                                                      s_k[:, 0, :][negative_index].permute(0, 2, 1)).squeeze(-1)
-        else:
-            negative_similarity_matrix = torch.matmul(s_q.unsqueeze(1),
-                                                      s_k[:, 0, :][negative_index].permute(0, 2, 1)).squeeze()
-        similarity_matrix = torch.cat([positive_similarity_matrix, negative_similarity_matrix], dim=-1)
-        similarity_matrix = similarity_matrix / self.configs.temperature
-        similarity_normed = self.log_softmax(similarity_matrix)
-        loss_cl = self.kl(similarity_normed, self.labels_cl)
-
-        # rebuild origin
-        positive_enc_out = enc_out[bs * n_vars:].reshape(bs * n_vars, self.configs.positive_nums, -1)
-        negative_enc_out = positive_enc_out[:, 0, :][negative_index]
-        rebuild_weight_matrix = self.softmax(similarity_matrix)
-        pos_att = rebuild_weight_matrix[:, :self.configs.positive_nums].unsqueeze(1)
-        neg_att = rebuild_weight_matrix[:, self.configs.positive_nums:].unsqueeze(1)
-        rebuild_embed = torch.matmul(pos_att, positive_enc_out) + torch.matmul(neg_att, negative_enc_out)
-        rebuild_embed = rebuild_embed.reshape(bs, n_vars, seq_len, -1)
-
-        # 补充原始的特征
-        trend_feat_in = trend.permute(0, 2, 1).unsqueeze(-1)
-        trend_feat = self.trend_projection_pretrain(trend_feat_in)
-
-        combined = torch.cat([rebuild_embed, trend_feat], dim=-1)
-
-        alpha = self.fusion_gate(combined)
-        fused_embed = alpha * rebuild_embed + (1 - alpha) * trend_feat
-        pred_x = self.head_pretrain(fused_embed)
-        pred_x = pred_x.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        pred_x = self.revin_layer_encoder(pred_x, 'denorm')
-        loss_rb = self.mse(batch_x, pred_x)
-        loss = self.awl(loss_cl, loss_rb)
-        return loss, loss_cl, loss_rb, None, None, None
 
     def pretrainWithContrast(self, batch_x):
         bs, seq_len, n_vars = batch_x.shape   # 这里对应的就是bs,178,1
@@ -721,83 +653,7 @@ class Model(nn.Module):
         pred_res = self.revin_layer_encoder(pred_res, 'denorm')
         trend_pred = self.trend_projector_forecast(trend.permute(0, 2, 1)).permute(0, 2, 1)
         return pred_res + trend_pred
-        # bs, seq_len, n_vars = x.shape
-        # # 添加moving_average
-        # trend_input = moving_average(x, self.decomp_kernel)
-        # res_input = x - trend_input
-        # z = self.revin_layer_encoder(res_input, 'norm')
-        # x = z
-        # x = x.permute(0, 2, 1)
-        # if self.configs.forcastMode == "freq":
-        #     x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-        #     x = x.reshape(-1, seq_len, 1)
-        # else:
-        #     x = x.reshape(-1, seq_len, 1)
-        # enc_emb = self.enc_embedding(x)
-        # enc_out, _ = self.encoder(enc_emb)
-        # res_pred = self.head_forecast(enc_out)
-        # res_pred = res_pred.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        # res_pred = self.revin_layer_encoder(res_pred, 'denorm')
-        # #合并
-        # trend_input = trend_input.reshape(-1,seq_len,1)
-        # trend_in_permuted = self.enc_embedding(trend_input)
-        #
-        #
-        # trend_pred = self.trend_projection(trend_in_permuted)
-        # # 换回 [B, P, N]
-        # trend_pred = trend_pred.reshape(-1, n_vars, self.configs.pred_len).permute(0, 2, 1)
-        # final_pred = res_pred + trend_pred
-        # return final_pred
-        '''
-        ========================分隔线=======================================
-        直接预测
-        '''
-        bs, seq_len, n_vars = x.shape
-        # 处理残差
-        z = self.revin_layer_encoder(x, 'norm')
-        x = z
-        x = x.permute(0, 2, 1)
-        if self.configs.forcastMode == "freq":
-            x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-            x = x.reshape(-1, seq_len, 1)
-        else:
-            x = x.reshape(-1, seq_len, 1)
-        x = self.enc_embedding(x)
-        enc_out, _ = self.encoder(x)
-        x = self.head_forecast(enc_out)
-        x = x.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        x = self.revin_layer_encoder(x, 'denorm')
-        return x
-        '''
-        在预测的时候，分离出趋势项，依靠encoder预测残差项，然后再加回去
-        '''
-        # bs, seq_len, n_vars = x.shape
-        #
-        # # 1. 分解
-        # trend = moving_average(x, self.decomp_kernel)
-        # res_ts = x - trend
-        #
-        # # 2. 残差路 (进 Encoder)
-        # z_res = self.revin_layer_encoder(res_ts, 'norm')
-        # # [B, S, N] -> [B*N, S, 1] (根据你的 DataEmbedding 需求调整)
-        # x = z_res
-        # x = x.permute(0, 2, 1)
-        # if self.configs.forcastMode == "freq":
-        #     x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-        #     x = x.reshape(-1, seq_len, 1)
-        # else:
-        #     x = x.reshape(-1, seq_len, 1)
-        # enc_in = self.enc_embedding(x)
-        # enc_out, _ = self.encoder(enc_in)  # 得到 Residual Features
-        #
-        # trend_pred = self.trend_projector_forecast(trend.permute(0, 2, 1)).permute(0, 2, 1)  # 需在init定义
-        #
-        # pred_res = self.head_forecast(enc_out)
-        # pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        # pred_res = self.revin_layer_encoder(pred_res, 'denorm')
-        #
-        # return pred_res + trend_pred
-
+      
     def forward(self, batch_x, batch_x_mark=None):
 
         if self.task_name == 'pretrain':
@@ -806,12 +662,10 @@ class Model(nn.Module):
                 return self.pretrainWithContrast(batch_x)
             elif self.configs.pretrain_mode == "0":
                 return self.pretrainWithContrast(batch_x)
-                # 如果你本来还有 pretrain() 逻辑，可以继续保留
-                return self.pretrainWithContrast(batch_x)
             elif self.configs.pretrain_mode == "residual":
                 return self.pretrain_context_gate(batch_x, batch_x_mark)
                 # 新增：基于残差的掩码重建预训练
-                return self.pretrain_context_gate(batch_x)
+                # return self.pretrain_context_gate(batch_x)
             else:
                 raise ValueError(f"Unsupported pretrain_mode: {self.configs.pretrain_mode}")
 

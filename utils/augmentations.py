@@ -294,23 +294,48 @@ def augment_positive(sample, masking_ratio, lm, distribution='geometric', scale=
 def augment_positive_test(sample, masking_ratio, lm, distribution='geometric', scale=0.1, k = 3):
     # 4/12
     b_n, seq_len = sample.shape
-    sample = sample.repeat(int(k/3), 1, 1)  # [(bs * positive_nums) x nvars x seq_len]
-    # mask
-    blank_mask = torch.tensor(
-        get_mask(sample, distribution, masking_ratio, lm, seq_len),
-        dtype=sample.dtype,
-        device=sample.device
+    sample_repeat = sample.repeat(int(k/3), 1, 1)  # [(bs * positive_nums) x nvars x seq_len]
+    
+    # 视图1: blank mask
+    blank_mask1 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    x_blank_masked = blank_mask1.to(sample_repeat.dtype) * sample_repeat
+    
+    # 视图2: noise mask (使用独立生成的 mask)
+    blank_mask2 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    t_noise = torch.tensor(
+        np.random.standard_t(df=2, size=sample_repeat.shape), dtype=sample_repeat.dtype, device=sample_repeat.device
+    ) * scale
+    x_t_distorted = sample_repeat + t_noise * (~blank_mask2).to(sample_repeat.dtype)
+    
+    # 视图3: zoom mask (使用独立生成的 mask)
+    blank_mask3 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    scale_factor = torch.rand(sample_repeat.shape, dtype=sample_repeat.dtype, device=sample_repeat.device) * 1.5 + 0.5
+    # x_zoomed = sample_repeat * blank_mask3 + sample_repeat * (1 - blank_mask3) * scale_factor
+    x_zoomed = (
+        sample_repeat * blank_mask3.to(sample_repeat.dtype)
+        + sample_repeat * (~blank_mask3).to(sample_repeat.dtype) * scale_factor
     )
-    # blank_mask
+    
+    # 合并增强后的样本
+    x_augmented = torch.cat([x_blank_masked, x_t_distorted, x_zoomed], dim=0)
+    return x_augmented.permute(1,0,2)
+
+
+def augment_positive_test_origin(sample, masking_ratio, lm, distribution='geometric', scale=0.1, k = 3):
+    """Original positive augmentation: reuse the same mask for all three views."""
+    b_n, seq_len = sample.shape
+    sample = sample.repeat(int(k/3), 1, 1)  # [(bs * positive_nums / 3) x nvars x seq_len]
+    blank_mask = get_mask(sample, distribution, masking_ratio, lm, seq_len)
+    blank_mask = blank_mask.to(sample.dtype)
+
     x_blank_masked = blank_mask * sample
-    # noise_mask
     t_noise = torch.tensor(
         np.random.standard_t(df=2, size=sample.shape), dtype=sample.dtype, device=sample.device
     ) * scale
     x_t_distorted = sample + t_noise * (1 - blank_mask)
-    # zoom_mask
+
     scale_factor = torch.rand(sample.shape, dtype=sample.dtype, device=sample.device) * 1.5 + 0.5
     x_zoomed = sample * blank_mask + sample * (1 - blank_mask) * scale_factor
-    # # 合并增强后的样本
+
     x_augmented = torch.cat([x_blank_masked, x_t_distorted, x_zoomed], dim=0)
     return x_augmented.permute(1,0,2)

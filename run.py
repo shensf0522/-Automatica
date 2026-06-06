@@ -159,7 +159,9 @@ parser.add_argument('--use_time_index', type=int, default=1, help='whether to us
 parser.add_argument('--time_feature_dim', type=int, default=6, help='maximum number of raw calendar time features projected into the trend context gate')
 parser.add_argument('--memory_size', type=int, default=64, help='trend context memory bank size')
 parser.add_argument('--top_k', type=int, default=5, help='top-k trend contexts retrieved from memory')
-
+parser.add_argument('--res_aug_version', type=str, default='new', choices=['new', 'origin'], help='positive augmentation used in FAT_res_trend_gate_new residual pretrain')
+parser.add_argument('--res_use_kb', type=int, default=1, help='whether to use KnowledgeGuide_encoder in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
+parser.add_argument('--res_use_revin', type=int, default=1, help='whether to use RevIN on residual series in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
 args = parser.parse_args()
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

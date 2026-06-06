@@ -1,4 +1,6 @@
 #!/bin/bash
+
+# 测试在预训练阶段，不使用revin,效果会不会更好，作为一个经验积累
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -11,10 +13,10 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606031008
+EXP_NAME=2606042155_aug_origin_revin
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -61,10 +63,11 @@ python -u run.py \
     --lm 3 \
     --positive_nums 3 \
     --negative_nums 1 \
+    --res_use_revin 0 \
     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
-for FORECAST_MODE in freq unfreq; do
-  for PRED_LEN in 96 192 336 720; do
+FORECAST_MODE=freq
+for PRED_LEN in 96 192 336 720; do
     python -u run.py \
         --task_type reg \
         --pretrain_mode residual \
@@ -78,7 +81,6 @@ for FORECAST_MODE in freq unfreq; do
         --exp_name ${EXP_NAME}_${FORECAST_MODE} \
         --pred_len ${PRED_LEN} \
         --patience 5 \
-        --forcastMode ${FORECAST_MODE} \
+        --forcastMode freq \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
-  done
 done

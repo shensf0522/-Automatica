@@ -1,4 +1,5 @@
 #!/bin/bash
+# 用来测试在预训练的时候不使用知识库，看看效果怎么样, 也就是不对时间序列的幅度进行拉伸
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -11,10 +12,10 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606031008
+EXP_NAME=2606042155_aug_origin_pretrain_kb
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -61,10 +62,11 @@ python -u run.py \
     --lm 3 \
     --positive_nums 3 \
     --negative_nums 1 \
+    --res_use_kb 0 \
     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
-for FORECAST_MODE in freq unfreq; do
-  for PRED_LEN in 96 192 336 720; do
+FORECAST_MODE=freq
+for PRED_LEN in 96 192 336 720; do
     python -u run.py \
         --task_type reg \
         --pretrain_mode residual \
@@ -78,7 +80,6 @@ for FORECAST_MODE in freq unfreq; do
         --exp_name ${EXP_NAME}_${FORECAST_MODE} \
         --pred_len ${PRED_LEN} \
         --patience 5 \
-        --forcastMode ${FORECAST_MODE} \
+        --forcastMode freq \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
-  done
 done
