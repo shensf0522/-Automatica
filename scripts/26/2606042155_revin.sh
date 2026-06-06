@@ -13,7 +13,7 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 
 MODEL=FAT_res_trend_gate_new
 EXP_NAME=2606042155_aug_origin_revin
