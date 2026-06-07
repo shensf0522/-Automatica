@@ -11,7 +11,7 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 MODEL=FAT_res_trend_gate_new
 EXP_NAME=2606070200_A

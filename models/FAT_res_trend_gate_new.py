@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
-from utils.augmentations import augment_positive_test
+from utils.augmentations import (
+    augment_positive_test, augment_positive_test_origin,
+    denoise_multi_view, denoise_multi_view_freq,
+)
 from utils.tools import ContrastiveWeight, AggregationRebuild, generate_CLLabels, FFT_sim
 from utils.losses import AutomaticWeightedLoss
 from layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer
@@ -389,6 +392,20 @@ class Model(nn.Module):
         self.memory_top_k = getattr(configs, 'top_k', 5)
         self.use_time_index = bool(getattr(configs, 'use_time_index', 1))
         self.time_feature_dim = getattr(configs, 'time_feature_dim', 6)
+        self.res_aug_version = getattr(configs, 'res_aug_version', 'new')
+        self.res_use_kb = bool(getattr(configs, 'res_use_kb', 1))
+        self.res_use_revin = bool(getattr(configs, 'res_use_revin', 1))
+        self.res_recon_target = getattr(configs, 'res_recon_target', 'raw')
+        _aug_map = {
+            'origin': augment_positive_test_origin,
+            'mask_indep': augment_positive_test,
+            'denoise': denoise_multi_view,
+            'denoise_freq': denoise_multi_view_freq,
+        }
+        if self.res_aug_version not in _aug_map:
+            raise ValueError(f"Unsupported res_aug_version: {self.res_aug_version}. "
+                             f"Choose from {list(_aug_map.keys())}")
+        self.res_augment_fn = _aug_map[self.res_aug_version]
 
         self.trend_context_encoder = TrendContextEncoder(
             configs.d_model,
@@ -484,15 +501,22 @@ class Model(nn.Module):
 
         trend = moving_average(batch_x, self.decomp_kernel)
         res_ts = batch_x - trend
-        z = self.revin_layer_encoder(res_ts, 'norm')
+        if self.res_use_revin:
+            z = self.revin_layer_encoder(res_ts, 'norm')
+        else:
+            z = res_ts
 
         r_series = z.permute(0, 2, 1)
         sim_matrix = FFT_sim(r_series)
         r_normed = r_series.reshape(-1, seq_len)
         negative_index = torch.topk(sim_matrix, k=self.configs.negative_nums, dim=1).indices
 
-        r_reformed, _ = self.KnowledgeGuide_encoder(r_normed)
-        r_positives = augment_positive_test(
+        if self.res_use_kb:
+            r_reformed, _ = self.KnowledgeGuide_encoder(r_normed)
+        else:
+            r_reformed = r_normed
+
+        r_positives = self.res_augment_fn(
             r_reformed,
             self.configs.mask_rate,
             self.configs.lm,
@@ -543,10 +567,25 @@ class Model(nn.Module):
         fused_embed, _ = self._filter_residual_with_context(rebuild_embed, trend, batch_x_mark)
         pred_res = self.head_pretrain(fused_embed)
         pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        pred_res = self.revin_layer_encoder(pred_res, 'denorm')
+        if self.res_use_revin:
+            pred_res = self.revin_layer_encoder(pred_res, 'denorm')
         pred_x = pred_res + trend
 
-        loss_rb = self.mse(batch_x, pred_x)
+        # --- 版本 A / B 重建目标 ---
+        if self.res_recon_target == 'consensus':
+            # 版本B：用三个去噪视图的共识作为更干净的重建目标
+            # r_positives_raw: (bs*n_vars*k, seq_len) -> (bs*n_vars, k, seq_len)
+            views_for_consensus = r_positives.reshape(bs * n_vars, self.configs.positive_nums, seq_len)
+            consensus_res = views_for_consensus.mean(dim=1)        # (bs*n_vars, seq_len)
+            consensus_res = consensus_res.reshape(bs, n_vars, seq_len).permute(0, 2, 1)  # (bs, seq_len, n_vars)
+            if self.res_use_revin:
+                consensus_res = self.revin_layer_encoder(consensus_res, 'denorm')
+            target_x = consensus_res + trend
+        else:
+            # 版本A（默认）：重建原始信号
+            target_x = batch_x
+
+        loss_rb = self.mse(target_x, pred_x)
         loss = self.awl(loss_cl, loss_rb)
         return loss, loss_cl, loss_rb, None, None, None
 
