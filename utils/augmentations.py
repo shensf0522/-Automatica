@@ -434,3 +434,60 @@ def denoise_multi_view_freq(sample, masking_ratio=None, lm=None, distribution=No
 
     views = torch.stack([view1, view2, view3], dim=1)            # (b_n, 3, seq_len)
     return views[:, :k, :]
+
+
+def augment_noise_views(sample, masking_ratio, lm, distribution='geometric', scale=0.1, k=3):
+    """
+    策略F：多类型噪声注入增强，用于去噪预训练。
+
+    保留 masking 机制，但将「置零」和「拉伸」替换为另外两种噪声注入。
+    三个视图分别在各自独立的 mask 位置注入不同类型的噪声：
+      View 1 – 高斯噪声 (白噪声, i.i.d.)：模拟标准测量噪声
+      View 2 – 拉普拉斯噪声 (重尾, 稀疏脉冲型)：模拟偶发的大幅扰动
+      View 3 – 有色噪声 (时域相关, 低频漂移型)：模拟缓慢漂移噪声
+
+    模型的任务：从含噪视图中重建原始干净信号，从而学会去噪。
+
+    Args:
+        sample: (b_n, seq_len) 输入信号
+        masking_ratio: 掩码比例
+        lm: 几何分布的平均掩码长度
+        distribution: 掩码分布类型
+        scale: 噪声幅度缩放因子
+        k: 正样本数量（固定为3）
+
+    Returns:
+        (b_n, k, seq_len) 含噪视图
+    """
+    b_n, seq_len = sample.shape
+    sample_repeat = sample.repeat(int(k / 3), 1, 1)  # (k/3, b_n, seq_len)
+
+    # --- View 1: 高斯白噪声 ---
+    mask1 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    gaussian_noise = torch.randn_like(sample_repeat) * scale
+    x_gaussian = sample_repeat + gaussian_noise * (~mask1).to(sample_repeat.dtype)
+
+    # --- View 2: 拉普拉斯噪声（重尾脉冲型）---
+    mask2 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    # 手动生成拉普拉斯分布：sign(U-0.5) * (-b * log(1 - 2|U-0.5|))
+    u = torch.rand_like(sample_repeat) - 0.5
+    laplace_noise = -scale * torch.sign(u) * torch.log1p(-2.0 * torch.abs(u) + 1e-7)
+    x_laplace = sample_repeat + laplace_noise * (~mask2).to(sample_repeat.dtype)
+
+    # --- View 3: 有色噪声（时域相关漂移型）---
+    mask3 = get_mask(sample_repeat, distribution, masking_ratio, lm, seq_len)
+    # 先生成白噪声，再用移动平均平滑为时域相关噪声
+    white_noise = torch.randn_like(sample_repeat) * scale * 2.0
+    smooth_kernel = 5
+    pad_l = (smooth_kernel - 1) // 2
+    pad_r = smooth_kernel - 1 - pad_l
+    flat_noise = white_noise.reshape(-1, 1, seq_len)  # (k/3 * b_n, 1, seq_len)
+    padded_noise = F.pad(flat_noise, (pad_l, pad_r), mode='replicate')
+    colored_noise = F.avg_pool1d(padded_noise, smooth_kernel, stride=1)
+    colored_noise = colored_noise.reshape(sample_repeat.shape)
+    x_colored = sample_repeat + colored_noise * (~mask3).to(sample_repeat.dtype)
+
+    # 合并增强后的样本
+    x_augmented = torch.cat([x_gaussian, x_laplace, x_colored], dim=0)  # (k, b_n, seq_len)
+    return x_augmented.permute(1, 0, 2)  # (b_n, k, seq_len)
+

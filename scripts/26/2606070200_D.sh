@@ -1,8 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# 实验版本 B: 去噪共识重建 (Consensus Reconstruction Target)
+# 实验版本 D: 双Loss限制重建 (Double Loss Target)
 # - 增强策略: denoise (时域多视角去噪: 平滑 + 中值 + 可预测性滤波)
-# - 重建目标: consensus (以 3 个去噪视图的均值共识作为更干净的重建目标)
+# - 损失设计: double (同时优化 loss_clean 和 loss_faithful)
+# - 超参数: res_double_beta = 0.3
 # ==============================================================================
 if [ ! -d "./logs" ]; then
     mkdir ./logs
@@ -19,7 +20,7 @@ set -e
 export CUDA_VISIBLE_DEVICES=0
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606070200_B
+EXP_NAME=2606070200_D
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -67,7 +68,8 @@ python -u run.py \
     --positive_nums 3 \
     --negative_nums 1 \
     --res_aug_version denoise \
-    --res_recon_target consensus \
+    --res_recon_target double \
+    --res_double_beta 0.3 \
     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
 for FORECAST_MODE in freq unfreq; do
@@ -87,7 +89,8 @@ for FORECAST_MODE in freq unfreq; do
         --patience 5 \
         --forcastMode ${FORECAST_MODE} \
         --res_aug_version denoise \
-        --res_recon_target consensus \
+        --res_recon_target double \
+        --res_double_beta 0.3 \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
   done
 done

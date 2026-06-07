@@ -1,8 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# 实验版本 B: 去噪共识重建 (Consensus Reconstruction Target)
-# - 增强策略: denoise (时域多视角去噪: 平滑 + 中值 + 可预测性滤波)
-# - 重建目标: consensus (以 3 个去噪视图的均值共识作为更干净的重建目标)
+# 实验版本 F: 多类型噪声注入增强 (Multi-Noise Injection Augmentation)
+# - 增强策略: noise_inject (在 mask 位置注入 3 种不同噪声:
+#     View1=高斯白噪声, View2=拉普拉斯重尾噪声, View3=有色漂移噪声)
+# - 重建目标: raw (从含噪视图重建原始干净信号，学会去噪能力)
+# - CL分支: 含噪视图作为原始信号的正样本，仍使用KL散度对齐
 # ==============================================================================
 if [ ! -d "./logs" ]; then
     mkdir ./logs
@@ -19,7 +21,7 @@ set -e
 export CUDA_VISIBLE_DEVICES=0
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606070200_B
+EXP_NAME=2606070200_F
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -66,8 +68,8 @@ python -u run.py \
     --lm 3 \
     --positive_nums 3 \
     --negative_nums 1 \
-    --res_aug_version denoise \
-    --res_recon_target consensus \
+    --res_aug_version noise_inject \
+    --res_recon_target raw \
     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
 for FORECAST_MODE in freq unfreq; do
@@ -86,8 +88,8 @@ for FORECAST_MODE in freq unfreq; do
         --pred_len ${PRED_LEN} \
         --patience 5 \
         --forcastMode ${FORECAST_MODE} \
-        --res_aug_version denoise \
-        --res_recon_target consensus \
+        --res_aug_version noise_inject \
+        --res_recon_target raw \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
   done
 done

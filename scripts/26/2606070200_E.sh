@@ -1,8 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# 实验版本 B: 去噪共识重建 (Consensus Reconstruction Target)
+# 实验版本 E: 噪声相关性惩罚项 (Noise Correlation Penalty Target)
 # - 增强策略: denoise (时域多视角去噪: 平滑 + 中值 + 可预测性滤波)
-# - 重建目标: consensus (以 3 个去噪视图的均值共识作为更干净的重建目标)
+# - 损失设计: noise_penalty (重建原始信号的同时惩罚重建误差与估计噪声的对齐度)
+# - 超参数: res_penalty_gamma = 0.1
 # ==============================================================================
 if [ ! -d "./logs" ]; then
     mkdir ./logs
@@ -19,7 +20,7 @@ set -e
 export CUDA_VISIBLE_DEVICES=0
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606070200_B
+EXP_NAME=2606070200_E
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -67,7 +68,8 @@ python -u run.py \
     --positive_nums 3 \
     --negative_nums 1 \
     --res_aug_version denoise \
-    --res_recon_target consensus \
+    --res_recon_target noise_penalty \
+    --res_penalty_gamma 0.1 \
     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
 for FORECAST_MODE in freq unfreq; do
@@ -87,7 +89,8 @@ for FORECAST_MODE in freq unfreq; do
         --patience 5 \
         --forcastMode ${FORECAST_MODE} \
         --res_aug_version denoise \
-        --res_recon_target consensus \
+        --res_recon_target noise_penalty \
+        --res_penalty_gamma 0.1 \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
   done
 done

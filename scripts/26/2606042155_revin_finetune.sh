@@ -1,9 +1,6 @@
 #!/bin/bash
-# ==============================================================================
-# 实验版本 B: 去噪共识重建 (Consensus Reconstruction Target)
-# - 增强策略: denoise (时域多视角去噪: 平滑 + 中值 + 可预测性滤波)
-# - 重建目标: consensus (以 3 个去噪视图的均值共识作为更干净的重建目标)
-# ==============================================================================
+
+# 通过2606042155_revin的结果表示，在预训练阶段不用revin，效果会有提升，测试下在微调不使用revin，是否会进一步提升性能。
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -19,7 +16,7 @@ set -e
 export CUDA_VISIBLE_DEVICES=0
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606070200_B
+EXP_NAME=2606042155_aug_origin_revin_finetune
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 
@@ -56,27 +53,26 @@ COMMON_ARGS="\
     --embed timeF \
     --freq h"
 
-python -u run.py \
-    --exp_name ${EXP_NAME} \
-    --task_name pretrain \
-    --pretrain_mode residual \
-    --learning_rate 0.0008 \
-    --pretrain_epochs 50 \
-    --mask_rate 0.5 \
-    --lm 3 \
-    --positive_nums 3 \
-    --negative_nums 1 \
-    --res_aug_version denoise \
-    --res_recon_target consensus \
-    ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
+# python -u run.py \
+#     --exp_name ${EXP_NAME} \
+#     --task_name pretrain \
+#     --pretrain_mode residual \
+#     --learning_rate 0.0008 \
+#     --pretrain_epochs 50 \
+#     --mask_rate 0.5 \
+#     --lm 3 \
+#     --positive_nums 3 \
+#     --negative_nums 1 \
+#     --res_use_revin 0 \
+#     ${COMMON_ARGS} >logs/pretrain/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN.log
 
-for FORECAST_MODE in freq unfreq; do
-  for PRED_LEN in 96 192 336 720; do
+FORECAST_MODE=freq
+for PRED_LEN in 96 192 336 720; do
     python -u run.py \
         --task_type reg \
         --pretrain_mode residual \
         --task_name finetune \
-        --transfer_expname ${TRANSFER_EXP_NAME} \
+        --transfer_expname 2606042155_aug_origin_revin \
         --freeze 1 \
         --learning_rate 0.0001 \
         --train_epochs 20 \
@@ -85,9 +81,7 @@ for FORECAST_MODE in freq unfreq; do
         --exp_name ${EXP_NAME}_${FORECAST_MODE} \
         --pred_len ${PRED_LEN} \
         --patience 5 \
-        --forcastMode ${FORECAST_MODE} \
-        --res_aug_version denoise \
-        --res_recon_target consensus \
+        --forcastMode freq \
+        --finetune_use_revin 0 \
         ${COMMON_ARGS} >logs/LongForecasting/$EXP_NAME'_'$MODEL'_'$DATASET'_'$SEQ_LEN'_'$PRED_LEN'_'$FORECAST_MODE.log
-  done
 done

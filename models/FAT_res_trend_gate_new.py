@@ -3,6 +3,7 @@ import torch.nn as nn
 from utils.augmentations import (
     augment_positive_test, augment_positive_test_origin,
     denoise_multi_view, denoise_multi_view_freq,
+    augment_noise_views,
 )
 from utils.tools import ContrastiveWeight, AggregationRebuild, generate_CLLabels, FFT_sim
 from utils.losses import AutomaticWeightedLoss
@@ -396,11 +397,16 @@ class Model(nn.Module):
         self.res_use_kb = bool(getattr(configs, 'res_use_kb', 1))
         self.res_use_revin = bool(getattr(configs, 'res_use_revin', 1))
         self.res_recon_target = getattr(configs, 'res_recon_target', 'raw')
+        self.res_mix_alpha = getattr(configs, 'res_mix_alpha', 0.5)
+        self.res_double_beta = getattr(configs, 'res_double_beta', 0.3)
+        self.res_penalty_gamma = getattr(configs, 'res_penalty_gamma', 0.1)
+        self.finetune_use_revin = bool(getattr(configs, 'finetune_use_revin', 1))
         _aug_map = {
             'origin': augment_positive_test_origin,
             'mask_indep': augment_positive_test,
             'denoise': denoise_multi_view,
             'denoise_freq': denoise_multi_view_freq,
+            'noise_inject': augment_noise_views,
         }
         if self.res_aug_version not in _aug_map:
             raise ValueError(f"Unsupported res_aug_version: {self.res_aug_version}. "
@@ -564,30 +570,48 @@ class Model(nn.Module):
         rebuild_embed = torch.matmul(pos_att, positive_enc_out) + torch.matmul(neg_att, negative_enc_out)
         rebuild_embed = rebuild_embed.reshape(bs, n_vars, seq_len, -1)
 
-        fused_embed, _ = self._filter_residual_with_context(rebuild_embed, trend, batch_x_mark)
+        fused_embed, keep_score = self._filter_residual_with_context(rebuild_embed, trend, batch_x_mark)
         pred_res = self.head_pretrain(fused_embed)
         pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
         if self.res_use_revin:
             pred_res = self.revin_layer_encoder(pred_res, 'denorm')
         pred_x = pred_res + trend
 
-        # --- 版本 A / B 重建目标 ---
-        if self.res_recon_target == 'consensus':
-            # 版本B：用三个去噪视图的共识作为更干净的重建目标
-            # r_positives_raw: (bs*n_vars*k, seq_len) -> (bs*n_vars, k, seq_len)
-            views_for_consensus = r_positives.reshape(bs * n_vars, self.configs.positive_nums, seq_len)
-            consensus_res = views_for_consensus.mean(dim=1)        # (bs*n_vars, seq_len)
-            consensus_res = consensus_res.reshape(bs, n_vars, seq_len).permute(0, 2, 1)  # (bs, seq_len, n_vars)
-            if self.res_use_revin:
-                consensus_res = self.revin_layer_encoder(consensus_res, 'denorm')
-            target_x = consensus_res + trend
-        else:
-            # 版本A（默认）：重建原始信号
-            target_x = batch_x
+        # --- 计算去噪共识 target 用作去噪基准 ---
+        views_for_consensus = r_positives.reshape(bs * n_vars, self.configs.positive_nums, seq_len)
+        consensus_res = views_for_consensus.mean(dim=1)        # (bs*n_vars, seq_len)
+        consensus_res = consensus_res.reshape(bs, n_vars, seq_len).permute(0, 2, 1)  # (bs, seq_len, n_vars)
+        if self.res_use_revin:
+            consensus_res = self.revin_layer_encoder(consensus_res, 'denorm')
+        consensus_x = consensus_res + trend
 
-        loss_rb = self.mse(target_x, pred_x)
+        # --- 重建目标与 Loss 范式选择 (A / B / C / D / E) ---
+        if self.res_recon_target == 'raw':
+            # 版本A：纯原始信号重建
+            loss_rb = self.mse(batch_x, pred_x)
+        elif self.res_recon_target == 'consensus':
+            # 版本B：纯去噪共识重建
+            loss_rb = self.mse(consensus_x, pred_x)
+        elif self.res_recon_target == 'mix':
+            # 方案C：混合目标重建
+            target_x = self.res_mix_alpha * consensus_x + (1.0 - self.res_mix_alpha) * batch_x
+            loss_rb = self.mse(target_x, pred_x)
+        elif self.res_recon_target == 'double':
+            # 方案D：双重Loss限制
+            loss_clean = self.mse(consensus_x, pred_x)
+            loss_faithful = self.mse(batch_x, pred_x)
+            loss_rb = loss_clean + self.res_double_beta * loss_faithful
+        elif self.res_recon_target == 'noise_penalty':
+            # 方案E：噪声相关性惩罚
+            noise_estimate = (batch_x - consensus_x).detach()
+            recon_error = pred_x - consensus_x
+            noise_correlation = torch.mean(recon_error * noise_estimate)
+            loss_rb = self.mse(batch_x, pred_x) + self.res_penalty_gamma * torch.abs(noise_correlation)
+        else:
+            raise ValueError(f"Unknown res_recon_target: {self.res_recon_target}")
+
         loss = self.awl(loss_cl, loss_rb)
-        return loss, loss_cl, loss_rb, None, None, None
+        return loss, loss_cl, loss_rb, keep_score.mean().detach(), None, None
 
 
     def pretrain_residual(self, batch_x, batch_x_mark=None):
@@ -744,7 +768,10 @@ class Model(nn.Module):
         trend = moving_average(x, self.decomp_kernel)
         res_ts = x - trend
 
-        z = self.revin_layer_encoder(res_ts, 'norm')
+        if self.finetune_use_revin == 1:
+            z = self.revin_layer_encoder(res_ts, 'norm')
+        else:
+            z = res_ts
         x_res = z.permute(0, 2, 1)
         if self.configs.forcastMode == "freq":
             x_res, _ = self.KnowledgeGuide_encoder(x_res)
@@ -757,86 +784,12 @@ class Model(nn.Module):
         res_embed = enc_out.reshape(bs, n_vars, seq_len, -1)
         fused_embed, _ = self._filter_residual_with_context(res_embed, trend, x_mark)
         pred_res = self.head_forecast(fused_embed).permute(0, 2, 1)
-        pred_res = self.revin_layer_encoder(pred_res, 'denorm')
+        if self.finetune_use_revin == 1:
+            pred_res = self.revin_layer_encoder(pred_res, 'denorm')
+    
         trend_pred = self.trend_projector_forecast(trend.permute(0, 2, 1)).permute(0, 2, 1)
         return pred_res + trend_pred
-        # bs, seq_len, n_vars = x.shape
-        # # 添加moving_average
-        # trend_input = moving_average(x, self.decomp_kernel)
-        # res_input = x - trend_input
-        # z = self.revin_layer_encoder(res_input, 'norm')
-        # x = z
-        # x = x.permute(0, 2, 1)
-        # if self.configs.forcastMode == "freq":
-        #     x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-        #     x = x.reshape(-1, seq_len, 1)
-        # else:
-        #     x = x.reshape(-1, seq_len, 1)
-        # enc_emb = self.enc_embedding(x)
-        # enc_out, _ = self.encoder(enc_emb)
-        # res_pred = self.head_forecast(enc_out)
-        # res_pred = res_pred.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        # res_pred = self.revin_layer_encoder(res_pred, 'denorm')
-        # #合并
-        # trend_input = trend_input.reshape(-1,seq_len,1)
-        # trend_in_permuted = self.enc_embedding(trend_input)
-        #
-        #
-        # trend_pred = self.trend_projection(trend_in_permuted)
-        # # 换回 [B, P, N]
-        # trend_pred = trend_pred.reshape(-1, n_vars, self.configs.pred_len).permute(0, 2, 1)
-        # final_pred = res_pred + trend_pred
-        # return final_pred
-        '''
-        ========================分隔线=======================================
-        直接预测
-        '''
-        bs, seq_len, n_vars = x.shape
-        # 处理残差
-        z = self.revin_layer_encoder(x, 'norm')
-        x = z
-        x = x.permute(0, 2, 1)
-        if self.configs.forcastMode == "freq":
-            x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-            x = x.reshape(-1, seq_len, 1)
-        else:
-            x = x.reshape(-1, seq_len, 1)
-        x = self.enc_embedding(x)
-        enc_out, _ = self.encoder(x)
-        x = self.head_forecast(enc_out)
-        x = x.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        x = self.revin_layer_encoder(x, 'denorm')
-        return x
-        '''
-        在预测的时候，分离出趋势项，依靠encoder预测残差项，然后再加回去
-        '''
-        # bs, seq_len, n_vars = x.shape
-        #
-        # # 1. 分解
-        # trend = moving_average(x, self.decomp_kernel)
-        # res_ts = x - trend
-        #
-        # # 2. 残差路 (进 Encoder)
-        # z_res = self.revin_layer_encoder(res_ts, 'norm')
-        # # [B, S, N] -> [B*N, S, 1] (根据你的 DataEmbedding 需求调整)
-        # x = z_res
-        # x = x.permute(0, 2, 1)
-        # if self.configs.forcastMode == "freq":
-        #     x, _ = self.KnowledgeGuide_encoder(x)  # B, N, D
-        #     x = x.reshape(-1, seq_len, 1)
-        # else:
-        #     x = x.reshape(-1, seq_len, 1)
-        # enc_in = self.enc_embedding(x)
-        # enc_out, _ = self.encoder(enc_in)  # 得到 Residual Features
-        #
-        # trend_pred = self.trend_projector_forecast(trend.permute(0, 2, 1)).permute(0, 2, 1)  # 需在init定义
-        #
-        # pred_res = self.head_forecast(enc_out)
-        # pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
-        # pred_res = self.revin_layer_encoder(pred_res, 'denorm')
-        #
-        # return pred_res + trend_pred
-
+       
     def forward(self, batch_x, batch_x_mark=None):
 
         if self.task_name == 'pretrain':

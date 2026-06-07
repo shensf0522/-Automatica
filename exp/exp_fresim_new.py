@@ -20,7 +20,7 @@ warnings.filterwarnings('ignore')
 class Exp_fresim(Exp_Basic):
     def __init__(self, args):
         super(Exp_fresim, self).__init__(args)
-        self.writer = SummaryWriter(f"./outputs/logs/{args.data}/{args.model}/{args.pretrain_mode}")
+        self.writer = SummaryWriter(f"./outputs/logs/{args.data}/{args.model}/{args.pretrain_mode}/{args.exp_name}")
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
@@ -148,43 +148,48 @@ class Exp_fresim(Exp_Basic):
         for epoch in range(self.args.pretrain_epochs):
             start_time = time.time()
             if self.args.task_type == "clf":
-                train_loss, train_cl_loss, train_rb_loss = self.pretrain_one_epoch(train_loader,
+                train_loss, train_cl_loss, train_rb_loss, train_gate = self.pretrain_one_epoch(train_loader,
                                                                                                  model_optim,
                                                                                                  model_scheduler)
-                vali_loss, valid_cl_loss, valid_rb_loss = self.valid_one_epoch(vali_loader)
-                test_loss, test_cl_loss, test_rb_loss = self.valid_one_epoch(test_loader)
+                vali_loss, valid_cl_loss, valid_rb_loss, vali_gate = self.valid_one_epoch(vali_loader)
+                test_loss, test_cl_loss, test_rb_loss, test_gate = self.valid_one_epoch(test_loader)
 
             else:
-                train_loss, train_cl_loss, train_rb_loss = self.pretrain_one_epoch(train_loader, model_optim, model_scheduler)
-                vali_loss, valid_cl_loss, valid_rb_loss = self.valid_one_epoch(vali_loader)
-                test_loss, test_cl_loss, test_rb_loss = self.valid_one_epoch(test_loader)
+                train_loss, train_cl_loss, train_rb_loss, train_gate = self.pretrain_one_epoch(train_loader, model_optim, model_scheduler)
+                vali_loss, valid_cl_loss, valid_rb_loss, vali_gate = self.valid_one_epoch(vali_loader)
+                test_loss, test_cl_loss, test_rb_loss, test_gate = self.valid_one_epoch(test_loader)
 
             # log and Loss
             end_time = time.time()
 
             print(
-                "Epoch: {0}, Lr: {1:.7f}, Time: {2:.2f}s | Train Loss: {3:.4f}/{4:.4f}/{5:.4f} Val Loss: {6:.4f}/{7:.4f}/{8:.4f} Test Loss: {9:.4f}/{10:.4f}/{11:.4f}\n"
+                "Epoch: {0}, Lr: {1:.7f}, Time: {2:.2f}s | Train Loss: {3:.4f}/{4:.4f}/{5:.4f} Val Loss: {6:.4f}/{7:.4f}/{8:.4f} Test Loss: {9:.4f}/{10:.4f}/{11:.4f} | Gate Keep Score: {12:.4f}/{13:.4f}/{14:.4f}\n"
                 .format(epoch, model_scheduler.get_lr()[0], end_time - start_time, train_loss, train_cl_loss,
                         train_rb_loss,
-                        vali_loss, valid_cl_loss, valid_rb_loss,  test_loss, test_cl_loss, test_rb_loss))
+                        vali_loss, valid_cl_loss, valid_rb_loss,  test_loss, test_cl_loss, test_rb_loss,
+                        train_gate, vali_gate, test_gate))
 
             pretrain_txt = path + "/" + "pretrain_loss.txt"
-            pretrain_content = "Epoch: {0}, Lr: {1:.7f}, Time: {2:.2f}s | Train Loss: {3:.4f}/{4:.4f}/{5:.4f} Val Loss: {6:.4f}/{7:.4f}/{8:.4f} Test Loss: {9:.4f}/{10:.4f}/{11:.4f}\n".format(
+            pretrain_content = "Epoch: {0}, Lr: {1:.7f}, Time: {2:.2f}s | Train Loss: {3:.4f}/{4:.4f}/{5:.4f} Val Loss: {6:.4f}/{7:.4f}/{8:.4f} Test Loss: {9:.4f}/{10:.4f}/{11:.4f} | Gate Keep Score: {12:.4f}/{13:.4f}/{14:.4f}\n".format(
                 epoch, model_scheduler.get_lr()[0], end_time - start_time, train_loss, train_cl_loss,
                 train_rb_loss,
-                vali_loss, valid_cl_loss, valid_rb_loss,  test_loss, test_cl_loss, test_rb_loss)
+                vali_loss, valid_cl_loss, valid_rb_loss,  test_loss, test_cl_loss, test_rb_loss,
+                train_gate, vali_gate, test_gate)
             get_record(pretrain_txt, pretrain_content)
 
             loss_scalar_dict = {
                 'train_loss': train_loss,
                 'train_cl_loss': train_cl_loss,
                 'train_rb_loss': train_rb_loss,
+                'train_gate_keep_score': train_gate,
                 'vali_loss': vali_loss,
                 'valid_cl_loss': valid_cl_loss,
                 'valid_rb_loss': valid_rb_loss,
+                'vali_gate_keep_score': vali_gate,
                 'test_loss': test_loss,
                 'test_cl_loss': test_cl_loss,
                 'test_rb_loss': test_rb_loss,
+                'test_gate_keep_score': test_gate,
             }
 
             self.writer.add_scalars(f"/pretrain_loss", loss_scalar_dict, epoch)
@@ -202,7 +207,7 @@ class Exp_fresim(Exp_Basic):
                 min_vali_loss = vali_loss
                 self.encoder_state_dict = self._collect_pretrain_state_dict()
                 encoder_ckpt = {'epoch': epoch, 'model_state_dict': self.encoder_state_dict}
-                torch.save(encoder_ckpt, os.path.join(path, f"ckpt_best_ptmode:{self.args.pretrain_mode}.pth"))
+                torch.save(encoder_ckpt, os.path.join(path, f"ckpt_best_ptmode_{self.args.pretrain_mode}.pth"))
 
             if (epoch + 1) % 10 == 0:
                 print("Saving model at epoch {}...".format(epoch + 1))
@@ -218,13 +223,14 @@ class Exp_fresim(Exp_Basic):
         train_loss = []
         train_cl_loss = []
         train_rb_loss = []
+        train_gate_score = []
 
         self.model.train()
         for i, (batch_x, batch_y ,*others) in enumerate(train_loader):
             model_optim.zero_grad()
             batch_x = batch_x.float().to(self.device)
             batch_x_mark = others[0].float().to(self.device) if len(others) > 0 else None
-            loss, loss_cl, loss_rb,_ ,_ ,_ = self._forward_model(batch_x, batch_x_mark)
+            loss, loss_cl, loss_rb, gate_score ,_ ,_ = self._forward_model(batch_x, batch_x_mark)
 
             # backward
             loss.backward()
@@ -234,19 +240,23 @@ class Exp_fresim(Exp_Basic):
             train_loss.append(loss.item())
             train_cl_loss.append(loss_cl.item())
             train_rb_loss.append(loss_rb.item())
+            if gate_score is not None:
+                train_gate_score.append(gate_score.item() if hasattr(gate_score, 'item') else gate_score)
 
         model_scheduler.step()
 
         train_loss = np.average(train_loss)
         train_cl_loss = np.average(train_cl_loss)
         train_rb_loss = np.average(train_rb_loss)
+        avg_gate_score = np.average(train_gate_score) if len(train_gate_score) > 0 else 0.0
 
-        return train_loss, train_cl_loss, train_rb_loss
+        return train_loss, train_cl_loss, train_rb_loss, avg_gate_score
 
     def valid_one_epoch(self, vali_loader):
         valid_loss = []
         valid_cl_loss = []
         valid_rb_loss = []
+        valid_gate_score = []
 
         self.model.eval()
         for i, (batch_x, batch_y, *others) in enumerate(vali_loader):
@@ -254,20 +264,22 @@ class Exp_fresim(Exp_Basic):
             batch_x = batch_x.float().to(self.device)
             batch_x_mark = others[0].float().to(self.device) if len(others) > 0 else None
             # encoder
-            loss, loss_cl, loss_rb, _, _, _ = self._forward_model(batch_x, batch_x_mark)
+            loss, loss_cl, loss_rb, gate_score, _, _ = self._forward_model(batch_x, batch_x_mark)
 
             # Record
             valid_loss.append(loss.item())
             valid_cl_loss.append(loss_cl.item())
             valid_rb_loss.append(loss_rb.item())
-
+            if gate_score is not None:
+                valid_gate_score.append(gate_score.item() if hasattr(gate_score, 'item') else gate_score)
 
         vali_loss = np.average(valid_loss)
         valid_cl_loss = np.average(valid_cl_loss)
         valid_rb_loss = np.average(valid_rb_loss)
+        avg_gate_score = np.average(valid_gate_score) if len(valid_gate_score) > 0 else 0.0
 
         self.model.train()
-        return vali_loss, valid_cl_loss, valid_rb_loss
+        return vali_loss, valid_cl_loss, valid_rb_loss, avg_gate_score
 
     def train(self, setting):
 
