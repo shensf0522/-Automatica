@@ -32,3 +32,9 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Papers folder for LaTeX files (ignored)
+papers/
+
+# Claude skills/settings (ignored)
+.claude/

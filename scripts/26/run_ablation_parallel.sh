@@ -12,49 +12,96 @@ if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
 
+# ==============================================================================
+# 【已注释】旧的并行消融实验
+# ==============================================================================
+# echo "=========================================="
+# echo "Starting all 5 experiments in parallel..."
+# echo "=========================================="
+# 
+# bash scripts/26/2606070200_B.sh &
+# PID_B=$!
+# echo "Option B running with PID: $PID_B"
+# 
+# bash scripts/26/2606070200_C.sh &
+# PID_C=$!
+# echo "Option C running with PID: $PID_C"
+# 
+# bash scripts/26/2606070200_D.sh &
+# PID_D=$!
+# echo "Option D running with PID: $PID_D"
+# 
+# bash scripts/26/2606070200_E.sh &
+# PID_E=$!
+# echo "Option E running with PID: $PID_E"
+# 
+# bash scripts/26/2606070200_F.sh &
+# PID_F=$!
+# echo "Option F running with PID: $PID_F"
+# 
+# echo "=========================================="
+# echo "Waiting for all experiments to complete..."
+# echo "=========================================="
+# 
+# wait $PID_B
+# echo "[DONE] Option B has completed."
+# 
+# wait $PID_C
+# echo "[DONE] Option C has completed."
+# 
+# wait $PID_D
+# echo "[DONE] Option D has completed."
+# 
+# wait $PID_E
+# echo "[DONE] Option E has completed."
+# 
+# wait $PID_F
+# echo "[DONE] Option F has completed."
+# 
+# echo "=========================================="
+# echo "All ablation experiments (B, C, D, E, F) have completed!"
+# echo "=========================================="
+
+
+# ==============================================================================
+# 【当前运行】新生成的四个长度与RevIN消融实验
+# ==============================================================================
 echo "=========================================="
-echo "Starting all 5 experiments in parallel..."
+echo "Starting 4 new parallel experiments..."
 echo "=========================================="
 
-bash scripts/26/2606070200_B.sh &
-PID_B=$!
-echo "Option B running with PID: $PID_B"
+bash scripts/26/2606090034_F_seq512_bs8.sh &
+PID_1=$!
+echo "[RUN] seq=512, bs=8, with revin running with PID: $PID_1"
 
-bash scripts/26/2606070200_C.sh &
-PID_C=$!
-echo "Option C running with PID: $PID_C"
+bash scripts/26/2606090034_F_seq512_bs8_no_revin.sh &
+PID_2=$!
+echo "[RUN] seq=512, bs=8, no revin running with PID: $PID_2"
 
-bash scripts/26/2606070200_D.sh &
-PID_D=$!
-echo "Option D running with PID: $PID_D"
+bash scripts/26/2606090034_F_seq720_bs4.sh &
+PID_3=$!
+echo "[RUN] seq=720, bs=4, with revin running with PID: $PID_3"
 
-bash scripts/26/2606070200_E.sh &
-PID_E=$!
-echo "Option E running with PID: $PID_E"
-
-bash scripts/26/2606070200_F.sh &
-PID_F=$!
-echo "Option F running with PID: $PID_F"
+bash scripts/26/2606090034_F_seq720_bs4_no_revin.sh &
+PID_4=$!
+echo "[RUN] seq=720, bs=4, no revin running with PID: $PID_4"
 
 echo "=========================================="
-echo "Waiting for all experiments to complete..."
+echo "Waiting for all 4 new experiments to complete..."
 echo "=========================================="
 
-wait $PID_B
-echo "[DONE] Option B has completed."
+wait $PID_1
+echo "[DONE] seq=512, bs=8, with revin has completed."
 
-wait $PID_C
-echo "[DONE] Option C has completed."
+wait $PID_2
+echo "[DONE] seq=512, bs=8, no revin has completed."
 
-wait $PID_D
-echo "[DONE] Option D has completed."
+wait $PID_3
+echo "[DONE] seq=720, bs=4, with revin has completed."
 
-wait $PID_E
-echo "[DONE] Option E has completed."
-
-wait $PID_F
-echo "[DONE] Option F has completed."
+wait $PID_4
+echo "[DONE] seq=720, bs=4, no revin has completed."
 
 echo "=========================================="
-echo "All ablation experiments (B, C, D, E, F) have completed!"
+echo "All 4 new experiments have completed!"
 echo "=========================================="
