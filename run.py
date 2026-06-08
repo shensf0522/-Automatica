@@ -159,7 +159,7 @@ parser.add_argument('--use_time_index', type=int, default=1, help='whether to us
 parser.add_argument('--time_feature_dim', type=int, default=6, help='maximum number of raw calendar time features projected into the trend context gate')
 parser.add_argument('--memory_size', type=int, default=64, help='trend context memory bank size')
 parser.add_argument('--top_k', type=int, default=5, help='top-k trend contexts retrieved from memory')
-parser.add_argument('--res_aug_version', type=str, default='denoise', choices=['origin', 'mask_indep', 'denoise', 'denoise_freq', 'noise_inject'], help='positive augmentation: origin=shared mask, mask_indep=independent masks, denoise=multi-view denoising, denoise_freq=denoising with freq view, noise_inject=multi-noise injection (strategy F)')
+parser.add_argument('--res_aug_version', type=str, default='denoise', choices=['origin', 'mask_indep', 'new', 'denoise', 'denoise_freq', 'noise_inject'], help='positive augmentation: origin=shared mask, mask_indep=independent masks, new=original positive test, denoise=multi-view denoising, denoise_freq=denoising with freq view, noise_inject=multi-noise injection (strategy F)')
 parser.add_argument('--res_use_kb', type=int, default=1, help='whether to use KnowledgeGuide_encoder in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
 parser.add_argument('--res_use_revin', type=int, default=1, help='whether to use RevIN on residual series in FAT_res_trend_gate_new residual pretrain; 1=on 0=off')
 parser.add_argument('--res_pretrain_use_time', type=int, default=0, help='whether to pass time features batch_x_mark to FAT_res_trend_gate_new during pretraining; 1=on 0=off')
@@ -167,7 +167,8 @@ parser.add_argument('--res_recon_target', type=str, default='raw', choices=['raw
 parser.add_argument('--res_mix_alpha', type=float, default=0.5, help='mix alpha for Option C: target = alpha * consensus + (1 - alpha) * raw')
 parser.add_argument('--res_double_beta', type=float, default=0.3, help='double beta for Option D: loss = loss_clean + beta * loss_faithful')
 parser.add_argument('--res_penalty_gamma', type=float, default=0.1, help='penalty gamma for Option E: loss = loss_raw + gamma * noise_correlation_penalty')
-parser.add_argument('--finetune_use_revin', type=int, default=1, help='whether to use RevIN on residual series in FAT_res_trend_gate_new residual finetune; 1=on 0=off')
+parser.add_argument('--trend_kernels', type=str, default='13,25,49', help='kernel sizes for learnable multi-scale decomposition')
+parser.add_argument('--trend_ema_decay', type=float, default=0.999, help='ema decay for memory bank online update')
 args = parser.parse_args()
 args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

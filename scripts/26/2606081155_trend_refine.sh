@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 测试在预训练阶段，不使用revin,效果会不会更好，作为一个经验积累
+# 测试重构的 x_trend 分支（多尺度可学习分解、导数签名、双向跨分支交互和 Memory Bank）对比 2606042155_revin.sh
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -13,10 +13,10 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
 MODEL=FAT_res_trend_gate_new
-EXP_NAME=2606042155_aug_origin_revin
+EXP_NAME=2606081155_trend_refine
 TRANSFER_EXP_NAME=${EXP_NAME}
 SEQ_LEN=336
 

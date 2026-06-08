@@ -227,27 +227,164 @@ class RevIN(nn.Module):
         return x
 
 
-class TrendContextEncoder(nn.Module):
-    def __init__(self, d_model, kernel_size, dropout):
+class LearnableMultiScaleDecomposition(nn.Module):
+    def __init__(self, n_vars, kernel_sizes=(13, 25, 49)):
         super().__init__()
-        self.kernel_size = max(1, int(kernel_size))
-        self.conv = nn.Conv1d(1, d_model, kernel_size=self.kernel_size)
+        self.n_scales = len(kernel_sizes)
+        self.convs = nn.ModuleList()
+        for ks in kernel_sizes:
+            conv = nn.Conv1d(
+                in_channels=n_vars,
+                out_channels=n_vars,
+                kernel_size=ks,
+                padding=0,
+                groups=n_vars,
+                bias=False
+            )
+            nn.init.constant_(conv.weight, 1.0 / ks)
+            self.convs.append(conv)
+
+    def forward(self, x):
+        x_t = x.permute(0, 2, 1)  # (bs, n_vars, seq_len)
+        trends = []
+        for conv in self.convs:
+            ks = conv.kernel_size[0]
+            left = (ks - 1) // 2
+            right = ks - 1 - left
+            x_pad = F.pad(x_t, (left, right), mode='replicate')
+            trend = conv(x_pad).permute(0, 2, 1)  # (bs, seq_len, n_vars)
+            trends.append(trend)
+        residual = x - trends[0]
+        return trends, residual
+
+class TrendDerivativeEncoder(nn.Module):
+    def __init__(self, n_vars, d_model, dropout=0.1):
+        super().__init__()
         self.proj = nn.Sequential(
+            nn.Linear(n_vars * 3, d_model),
             nn.GELU(),
-            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.Linear(d_model, d_model),
             nn.Dropout(dropout)
         )
 
     def forward(self, trend):
-        # trend: [B, S, N] -> [B, N, S, D]
-        bsz, seq_len, n_vars = trend.shape
-        x = trend.permute(0, 2, 1).reshape(bsz * n_vars, 1, seq_len)
-        left = (self.kernel_size - 1) // 2
-        right = self.kernel_size - 1 - left
-        x = F.pad(x, (left, right), mode='replicate')
-        x = self.proj(self.conv(x))
-        x = x.transpose(1, 2)
-        return x.reshape(bsz, n_vars, seq_len, -1)
+        d0 = trend
+        d1 = torch.zeros_like(trend)
+        d1[:, 1:, :] = trend[:, 1:, :] - trend[:, :-1, :]
+        d1[:, 0, :] = d1[:, 1, :]
+        
+        d2 = torch.zeros_like(d1)
+        d2[:, 1:, :] = d1[:, 1:, :] - d1[:, :-1, :]
+        d2[:, 0, :] = d2[:, 1, :]
+        combined = torch.cat([d0, d1, d2], dim=-1)
+        return self.proj(combined)
+
+class DerivativeAwareMemoryBank(nn.Module):
+    def __init__(self, memory_size, seq_len, d_model, ema_decay=0.999):
+        super().__init__()
+        self.memory_size = int(memory_size)
+        self.seq_len = int(seq_len)
+        self.d_model = d_model
+        self.ema_decay = ema_decay
+
+        self.register_buffer('keys', torch.randn(self.memory_size, d_model))
+        self.register_buffer('values', torch.zeros(self.memory_size, self.seq_len, d_model))
+        self.register_buffer('usage', torch.zeros(self.memory_size))
+
+    def retrieve(self, query_signature, top_k=5):
+        query_key = query_signature.mean(dim=1)
+        query_norm = F.normalize(query_key, dim=-1)
+        keys_norm = F.normalize(self.keys, dim=-1)
+
+        valid_mask = self.usage > 0
+        if valid_mask.sum() == 0:
+            return query_signature.new_zeros(
+                query_signature.size(0), top_k,
+                query_signature.size(1), query_signature.size(2)
+            )
+
+        sim = torch.matmul(query_norm, keys_norm.t())
+        sim[:, ~valid_mask] = -1e9
+        k = min(top_k, int(valid_mask.sum().item()))
+        indices = sim.topk(k, dim=-1).indices
+        retrieved = self.values[indices]
+
+        if k < top_k:
+            pad = retrieved[:, -1:].expand(-1, top_k - k, -1, -1)
+            retrieved = torch.cat([retrieved, pad], dim=1)
+        return retrieved
+
+    @torch.no_grad()
+    def update(self, signatures):
+        if not self.training:
+            return
+
+        new_keys = signatures.mean(dim=1).detach()
+        new_values = signatures.detach()
+
+        key_norm = F.normalize(new_keys, dim=-1)
+        bank_norm = F.normalize(self.keys, dim=-1)
+        sim = torch.matmul(key_norm, bank_norm.t())
+
+        for i in range(new_keys.size(0)):
+            best_slot = sim[i].argmax().item()
+
+            if self.usage[best_slot] == 0:
+                self.keys[best_slot] = new_keys[i]
+                self.values[best_slot] = new_values[i]
+                self.usage[best_slot] = 1.0
+            else:
+                self.keys[best_slot] = (
+                    self.ema_decay * self.keys[best_slot]
+                    + (1 - self.ema_decay) * new_keys[i]
+                )
+                self.values[best_slot] = (
+                    self.ema_decay * self.values[best_slot]
+                    + (1 - self.ema_decay) * new_values[i]
+                )
+
+class CrossBranchInteraction(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+
+        self.trend_to_resi_gate = nn.Sequential(
+            nn.Linear(4 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
+
+        self.resi_to_trend_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.resi_to_trend_gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def trend_guides_residual(self, resi_embed, trend_regime, memory_feat, time_context):
+        gate_input = torch.cat([resi_embed, trend_regime, memory_feat, time_context], dim=-1)
+        keep_score = self.trend_to_resi_gate(gate_input)
+        fused = keep_score * resi_embed + (1 - keep_score) * trend_regime
+        return self.norm(fused), keep_score
+
+    def residual_refines_trend(self, trend_feat, resi_feat):
+        resi_detached = resi_feat.detach()
+        attn_out, _ = self.resi_to_trend_attn(
+            query=trend_feat,
+            key=resi_detached,
+            value=resi_detached
+        )
+        gate_input = torch.cat([trend_feat, attn_out], dim=-1)
+        gate = self.resi_to_trend_gate(gate_input)
+        trend_refined = gate * trend_feat + (1 - gate) * attn_out
+        return self.norm(trend_refined)
 
 
 class CalendarTimeFeatureEmbedding(nn.Module):
@@ -274,60 +411,7 @@ class CalendarTimeFeatureEmbedding(nn.Module):
         return self.proj(x_mark)
 
 
-class TrendMemoryBank(nn.Module):
-    def __init__(self, max_size, d_model):
-        super().__init__()
-        self.max_size = int(max_size)
-        self.d_model = d_model
-        self.register_buffer('memory', torch.zeros(self.max_size, d_model))
-        self.register_buffer('ptr', torch.zeros(1, dtype=torch.long))
-        self.register_buffer('count', torch.zeros(1, dtype=torch.long))
 
-    def retrieve(self, query, top_k):
-        # query: [M, D]
-        valid = int(self.count.item())
-        top_k = max(1, int(top_k))
-        if valid == 0:
-            return query.new_zeros(query.size(0), top_k, self.d_model)
-
-        bank = self.memory[:valid]
-        query_norm = F.normalize(query, dim=-1)
-        bank_norm = F.normalize(bank, dim=-1)
-        similarity = torch.matmul(query_norm, bank_norm.t())
-        k = min(top_k, valid)
-        indices = similarity.topk(k, dim=-1).indices
-        retrieved = bank[indices]
-        if k < top_k:
-            pad = retrieved[:, -1:, :].expand(-1, top_k - k, -1)
-            retrieved = torch.cat([retrieved, pad], dim=1)
-        return retrieved
-
-    @torch.no_grad()
-    def update(self, values):
-        if values.numel() == 0:
-            return
-        values = values.detach()
-        if values.device != self.memory.device:
-            values = values.to(self.memory.device)
-
-        n_items = values.size(0)
-        if n_items >= self.max_size:
-            self.memory.copy_(values[-self.max_size:])
-            self.ptr.zero_()
-            self.count.fill_(self.max_size)
-            return
-
-        ptr = int(self.ptr.item())
-        end = ptr + n_items
-        if end <= self.max_size:
-            self.memory[ptr:end] = values
-        else:
-            first = self.max_size - ptr
-            self.memory[ptr:] = values[:first]
-            self.memory[:end - self.max_size] = values[first:]
-
-        self.ptr.fill_(end % self.max_size)
-        self.count.fill_(min(self.max_size, int(self.count.item()) + n_items))
 
 class Model(nn.Module):
 
@@ -381,7 +465,7 @@ class Model(nn.Module):
         self.kl = torch.nn.KLDivLoss(reduction='batchmean')
         self.awl = AutomaticWeightedLoss(2)
         self.mse = torch.nn.MSELoss()
-        self.trend_projector_forecast = nn.Linear(configs.seq_len, configs.pred_len)
+        self.trend_projector_forecast = nn.Linear(3 * configs.seq_len, configs.pred_len)
         # #趋势项的预测
         self.trend_projection_pretrain = nn.Linear(1, configs.d_model)
         # 在enc_out处融合趋势的编码
@@ -404,6 +488,7 @@ class Model(nn.Module):
         _aug_map = {
             'origin': augment_positive_test_origin,
             'mask_indep': augment_positive_test,
+            'new': augment_positive_test,
             'denoise': denoise_multi_view,
             'denoise_freq': denoise_multi_view_freq,
             'noise_inject': augment_noise_views,
@@ -413,37 +498,14 @@ class Model(nn.Module):
                              f"Choose from {list(_aug_map.keys())}")
         self.res_augment_fn = _aug_map[self.res_aug_version]
 
-        self.trend_context_encoder = TrendContextEncoder(
-            configs.d_model,
-            self.decomp_kernel,
-            getattr(configs, 'struct_dropout', configs.dropout)
-        )
+        self.decomp_kernels = [int(x) for x in getattr(configs, 'trend_kernels', '13,25,49').split(',')]
+        self.trend_decomposition = LearnableMultiScaleDecomposition(configs.enc_in, self.decomp_kernels)
+        self.trend_derivative_encoder = TrendDerivativeEncoder(configs.enc_in, configs.d_model, configs.dropout)
         self.calendar_time_embedding = CalendarTimeFeatureEmbedding(configs.d_model, self.time_feature_dim)
-        self.trend_memory_bank = TrendMemoryBank(self.memory_size, configs.d_model)
-        self.memory_proj = nn.Sequential(
-            nn.Linear(configs.d_model, configs.d_model),
-            nn.GELU(),
-            nn.Dropout(getattr(configs, 'struct_dropout', configs.dropout))
+        self.trend_memory_bank = DerivativeAwareMemoryBank(
+            self.memory_size, configs.seq_len, configs.d_model, getattr(configs, 'trend_ema_decay', 0.999)
         )
-        self.context_norm = nn.LayerNorm(configs.d_model)
-        self.context_attention = nn.MultiheadAttention(
-            embed_dim=configs.d_model,
-            num_heads=configs.n_heads,
-            dropout=configs.dropout,
-            batch_first=True
-        )
-        self.context_head = nn.Sequential(
-            nn.Linear(configs.d_model, configs.d_model),
-            nn.LayerNorm(configs.d_model),
-            nn.GELU(),
-            nn.Dropout(configs.dropout)
-        )
-        self.filter_gate = nn.Sequential(
-            nn.Linear(4 * configs.d_model, configs.d_model),
-            nn.GELU(),
-            nn.Linear(configs.d_model, configs.d_model),
-            nn.Sigmoid()
-        )
+        self.cross_branch_interaction = CrossBranchInteraction(configs.d_model, configs.n_heads, configs.dropout)
         self.fusion_norm = nn.LayerNorm(configs.d_model)
 
 
@@ -465,33 +527,56 @@ class Model(nn.Module):
         time_context = time_context.view(batch_size, 1, seq_len, -1)
         return time_context.expand(batch_size, n_vars, -1, -1)
 
-    def _retrieve_trend_memory(self, trend_context):
-        bsz, n_vars, seq_len, d_model = trend_context.shape
-        query = trend_context.mean(dim=2).reshape(bsz * n_vars, d_model)
-        retrieved = self.trend_memory_bank.retrieve(query, self.memory_top_k)
-        memory = self.memory_proj(retrieved).mean(dim=1)
-        if self.training:
-            self.trend_memory_bank.update(query)
-        return memory.view(bsz, n_vars, 1, d_model).expand(-1, -1, seq_len, -1)
-
-    def _filter_residual_with_context(self, rebuild_embed, trend, x_mark=None):
+    def _compute_trend_pipeline(self, rebuild_embed, trends, x_mark=None):
         bsz, n_vars, seq_len, d_model = rebuild_embed.shape
         time_context = self._build_time_context(
             bsz, n_vars, seq_len, rebuild_embed.device, rebuild_embed.dtype, x_mark
         )
-        trend_context = self.trend_context_encoder(trend) + time_context
-        memory_context = self._retrieve_trend_memory(trend_context)
-        context_source = self.context_norm(trend_context + memory_context)
 
-        query = self.context_norm(rebuild_embed.reshape(bsz * n_vars, seq_len, d_model))
-        key_value = context_source.reshape(bsz * n_vars, seq_len, d_model)
-        context_feat, _ = self.context_attention(query=query, key=key_value, value=key_value)
-        context_feat = self.context_head(context_feat).reshape(bsz, n_vars, seq_len, d_model)
+        refined_trends = []
+        memory_feats = []
 
-        gate_input = torch.cat([rebuild_embed, context_feat, memory_context, time_context], dim=-1)
-        keep_score = self.filter_gate(gate_input)
-        fused_embed = keep_score * rebuild_embed + (1 - keep_score) * context_feat
-        return self.fusion_norm(fused_embed), keep_score
+        for trend in trends:
+            sig = self.trend_derivative_encoder(trend)
+            sig_expanded = sig.unsqueeze(1).expand(-1, n_vars, -1, -1)
+
+            if x_mark is not None:
+                time_embed = self.calendar_time_embedding(x_mark)
+                time_embed = time_embed.unsqueeze(1).expand(-1, n_vars, -1, -1)
+                retrieval_input = sig_expanded + time_embed
+            else:
+                retrieval_input = sig_expanded
+
+            flat_input = retrieval_input.reshape(bsz * n_vars, seq_len, d_model)
+            retrieved = self.trend_memory_bank.retrieve(flat_input, self.memory_top_k)
+            mem_feat = retrieved.mean(dim=1)
+
+            if self.training:
+                self.trend_memory_bank.update(flat_input)
+
+            sig_flat = sig_expanded.reshape(bsz * n_vars, seq_len, d_model)
+            rebuild_flat = rebuild_embed.reshape(bsz * n_vars, seq_len, d_model)
+            trend_refined = self.cross_branch_interaction.residual_refines_trend(sig_flat, rebuild_flat)
+
+            refined_trends.append(trend_refined)
+            memory_feats.append(mem_feat.reshape(bsz, n_vars, seq_len, d_model))
+
+        trend_regime_agg = torch.stack(refined_trends, dim=0).mean(dim=0).reshape(bsz, n_vars, seq_len, d_model)
+        memory_feat_agg = torch.stack(memory_feats, dim=0).mean(dim=0)
+
+        fused_embed, keep_score = self.cross_branch_interaction.trend_guides_residual(
+            rebuild_embed, trend_regime_agg, memory_feat_agg, time_context
+        )
+
+        return fused_embed, keep_score, refined_trends
+
+    def _filter_residual_with_context(self, rebuild_embed, trend, x_mark=None):
+        if not isinstance(trend, list):
+            trends = [trend] * len(self.decomp_kernels)
+        else:
+            trends = trend
+        fused_embed, keep_score, _ = self._compute_trend_pipeline(rebuild_embed, trends, x_mark)
+        return fused_embed, keep_score
 
 
     def pretrain_context_gate(self, batch_x, batch_x_mark=None):
@@ -505,8 +590,7 @@ class Model(nn.Module):
         """
         bs, seq_len, n_vars = batch_x.shape
 
-        trend = moving_average(batch_x, self.decomp_kernel)
-        res_ts = batch_x - trend
+        trends, res_ts = self.trend_decomposition(batch_x)
         if self.res_use_revin:
             z = self.revin_layer_encoder(res_ts, 'norm')
         else:
@@ -570,12 +654,12 @@ class Model(nn.Module):
         rebuild_embed = torch.matmul(pos_att, positive_enc_out) + torch.matmul(neg_att, negative_enc_out)
         rebuild_embed = rebuild_embed.reshape(bs, n_vars, seq_len, -1)
 
-        fused_embed, keep_score = self._filter_residual_with_context(rebuild_embed, trend, batch_x_mark)
+        fused_embed, keep_score = self._filter_residual_with_context(rebuild_embed, trends, batch_x_mark)
         pred_res = self.head_pretrain(fused_embed)
         pred_res = pred_res.reshape(bs, n_vars, -1).permute(0, 2, 1)
         if self.res_use_revin:
             pred_res = self.revin_layer_encoder(pred_res, 'denorm')
-        pred_x = pred_res + trend
+        pred_x = pred_res + trends[0]
 
         # --- 计算去噪共识 target 用作去噪基准 ---
         views_for_consensus = r_positives.reshape(bs * n_vars, self.configs.positive_nums, seq_len)
@@ -583,7 +667,7 @@ class Model(nn.Module):
         consensus_res = consensus_res.reshape(bs, n_vars, seq_len).permute(0, 2, 1)  # (bs, seq_len, n_vars)
         if self.res_use_revin:
             consensus_res = self.revin_layer_encoder(consensus_res, 'denorm')
-        consensus_x = consensus_res + trend
+        consensus_x = consensus_res + trends[0]
 
         # --- 重建目标与 Loss 范式选择 (A / B / C / D / E) ---
         if self.res_recon_target == 'raw':
@@ -765,8 +849,7 @@ class Model(nn.Module):
 
     def forecast(self, x, x_mark=None):
         bs, seq_len, n_vars = x.shape
-        trend = moving_average(x, self.decomp_kernel)
-        res_ts = x - trend
+        trends, res_ts = self.trend_decomposition(x)
 
         if self.finetune_use_revin == 1:
             z = self.revin_layer_encoder(res_ts, 'norm')
@@ -782,12 +865,14 @@ class Model(nn.Module):
         enc_in = self.enc_embedding(x_res)
         enc_out, _ = self.encoder(enc_in)
         res_embed = enc_out.reshape(bs, n_vars, seq_len, -1)
-        fused_embed, _ = self._filter_residual_with_context(res_embed, trend, x_mark)
+        fused_embed, _ = self._filter_residual_with_context(res_embed, trends, x_mark)
         pred_res = self.head_forecast(fused_embed).permute(0, 2, 1)
         if self.finetune_use_revin == 1:
             pred_res = self.revin_layer_encoder(pred_res, 'denorm')
     
-        trend_pred = self.trend_projector_forecast(trend.permute(0, 2, 1)).permute(0, 2, 1)
+        trends_stacked = torch.stack(trends, dim=-1)
+        trends_flat = trends_stacked.permute(0, 2, 3, 1).reshape(bs, n_vars, -1)
+        trend_pred = self.trend_projector_forecast(trends_flat).permute(0, 2, 1)
         return pred_res + trend_pred
        
     def forward(self, batch_x, batch_x_mark=None):

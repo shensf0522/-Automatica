@@ -108,8 +108,9 @@ class Exp_fresim(Exp_Basic):
     def _forward_model(self, batch_x, batch_x_mark=None):
         if self.args.model == 'FAT_res_trend_gate' and batch_x_mark is not None:
             return self.model(batch_x, batch_x_mark)
-        elif self.args.model == 'FAT_res_trend_gate_new' and getattr(self.args, 'res_pretrain_use_time', 0) == 1 and batch_x_mark is not None:
-            return self.model(batch_x, batch_x_mark)
+        elif self.args.model == 'FAT_res_trend_gate_new' and batch_x_mark is not None:
+            if self.args.task_name == 'finetune' or getattr(self.args, 'res_pretrain_use_time', 0) == 1:
+                return self.model(batch_x, batch_x_mark)
         return self.model(batch_x)
 
     def _collect_pretrain_state_dict(self):
