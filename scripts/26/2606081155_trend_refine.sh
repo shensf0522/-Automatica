@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # 测试重构的 x_trend 分支（多尺度可学习分解、导数签名、双向跨分支交互和 Memory Bank）对比 2606042155_revin.sh
+# 但是由于OOM(out of memory), 只能修改为bs 为8了
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -13,7 +14,7 @@ if [ ! -d "./logs/pretrain" ]; then
 fi
 set -e
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 MODEL=FAT_res_trend_gate_new
 EXP_NAME=2606081155_trend_refine
@@ -39,7 +40,7 @@ COMMON_ARGS="\
     --e_layers 2 \
     --d_ff 32 \
     --seq_len ${SEQ_LEN} \
-    --batch_size 16 \
+    --batch_size 8 \
     --enc_in ${ENC_IN} \
     --dec_in ${DEC_IN} \
     --c_out ${C_OUT} \
