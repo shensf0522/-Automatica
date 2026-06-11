@@ -66,8 +66,14 @@ fi
 # ==============================================================================
 # 【当前运行】新生成的四个长度与RevIN消融实验
 # ==============================================================================
+# ==============================================================================
+# 【当前运行】新生成的四个长度与RevIN消融实验
+# 运行策略：
+#   第一阶段：先并行运行前 3 个实验
+#   第二阶段：前 3 个全部结束后，再运行最后 1 个实验，避免 OOM
+# ==============================================================================
 echo "=========================================="
-echo "Starting 4 new parallel experiments..."
+echo "Starting first 3 experiments in parallel..."
 echo "=========================================="
 
 bash scripts/26/2606090034_F_seq512_bs8.sh &
@@ -82,12 +88,8 @@ bash scripts/26/2606090034_F_seq720_bs4.sh &
 PID_3=$!
 echo "[RUN] seq=720, bs=4, with revin running with PID: $PID_3"
 
-bash scripts/26/2606090034_F_seq720_bs4_no_revin.sh &
-PID_4=$!
-echo "[RUN] seq=720, bs=4, no revin running with PID: $PID_4"
-
 echo "=========================================="
-echo "Waiting for all 4 new experiments to complete..."
+echo "Waiting for first 3 experiments to complete..."
 echo "=========================================="
 
 wait $PID_1
@@ -99,7 +101,12 @@ echo "[DONE] seq=512, bs=8, no revin has completed."
 wait $PID_3
 echo "[DONE] seq=720, bs=4, with revin has completed."
 
-wait $PID_4
+echo "=========================================="
+echo "First 3 experiments have completed."
+echo "Now starting the last experiment..."
+echo "=========================================="
+
+bash scripts/26/2606090034_F_seq720_bs4_no_revin.sh
 echo "[DONE] seq=720, bs=4, no revin has completed."
 
 echo "=========================================="
