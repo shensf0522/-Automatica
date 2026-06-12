@@ -36,5 +36,14 @@ Thumbs.db
 # Papers folder for LaTeX files (ignored)
 papers/
 
+#reference 
+reference_papers/
+
 # Claude skills/settings (ignored)
 .claude/
+
+# Paper Figures
+paper_figures/
+
+# plan
+plan/
